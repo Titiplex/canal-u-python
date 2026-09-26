@@ -13,34 +13,36 @@ from modules.db_manager import SQLManager
 
 class RetryTests(unittest.TestCase):
     def setUp(self):
-        crawling._use_browser = False
-        crawling._session_closed = False
+        crawling.configure()
+        self.client = crawling.Client()
+        self.addCleanup(self.client.close)
 
     def response(self, status=200, text='<h1>ok</h1>', headers=None):
         return Mock(status_code=status, text=text, headers=headers or {}, apparent_encoding='utf-8')
 
-    def test_browser_is_lazy_and_reused_after_challenge(self):
+    def test_browser_is_lazy_and_reused_for_unknown_challenge(self):
         session = Mock()
         session.get.side_effect = [self.response(), self.response(403, '<title>Challenge...</title>')]
-        with patch.object(crawling, 'session', session), patch.object(crawling, '_pace'), patch.object(crawling,
-                                                                                                       '_browser_fetch',
-                                                                                                       return_value='resolved') as browser, contextlib.redirect_stdout(
+        with patch.object(self.client, '_page', None), patch.object(self.client, 'session', session), patch.object(
+                crawling._gate, 'pace'), patch.object(self.client, '_browser_fetch',
+                                                      return_value='resolved') as browser, contextlib.redirect_stdout(
                 io.StringIO()):
-            self.assertEqual(crawling.crawl('https://example.test/one'), '<h1>ok</h1>')
+            self.assertEqual(self.client.crawl('https://example.test/one'), '<h1>ok</h1>')
             browser.assert_not_called()
-            self.assertEqual(crawling.crawl('https://example.test/two'), 'resolved')
-            self.assertEqual(crawling.crawl('https://example.test/three'), 'resolved')
+            self.assertEqual(self.client.crawl('https://example.test/two'), 'resolved')
+            self.assertEqual(self.client.crawl('https://example.test/three'), 'resolved')
         self.assertEqual(session.get.call_count, 2)
         self.assertEqual(browser.call_count, 2)
 
     def test_retry_after_and_plain_403_do_not_launch_browser(self):
         for response in [self.response(429, 'Challenge', {'Retry-After': '7200'}), self.response(403, 'Forbidden')]:
-            crawling._use_browser = False
-            with patch.object(crawling, 'session') as session, patch.object(crawling, '_pace'), patch.object(crawling,
-                                                                                                             '_browser_fetch') as browser:
+            crawling.configure()
+            self.client._use_browser = False
+            with patch.object(self.client, 'session') as session, patch.object(crawling._gate, 'pace'), patch.object(
+                    self.client, '_browser_fetch') as browser:
                 session.get.return_value = response
                 with self.assertRaises(crawling.RetryLater) as error:
-                    crawling.crawl('https://example.test')
+                    self.client.crawl('https://example.test')
                 browser.assert_not_called()
                 if response.status_code == 429:
                     self.assertGreaterEqual(error.exception.delay, 7200)
