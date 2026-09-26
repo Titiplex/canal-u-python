@@ -3,23 +3,20 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 
-def get_search_items(html: str) -> dict:
+def get_search_items(html: str, url: str = "https://www.canal-u.tv") -> dict:
     soup = BeautifulSoup(html, 'html.parser')
-
-    children_nodes = soup.find_all(attrs={'class': 'wrapper-content'})
-    bundle = soup.find_all(attrs={'class': 'wrapper-bundle'})
+    root = soup.select_one('.search-results') or soup.select_one('main') or soup
     children = {}
-
-    for child in children_nodes:
-        href = child.find('a')['href']
-        type_ = ""
-
-        for b in bundle:
-            if b['href'] == href:
-                type_ = b.get_text().lower()
-
-        children[href] = type_
-
+    for child in root.select('.wrapper-content'):
+        link = child.select_one('h3 a[href]')
+        if link is None or not link['href'].strip():
+            continue
+        card = child.find_parent('article')
+        bundle = card.select_one('.wrapper-bundle') if card else None
+        production = card.select_one('.field--name-field-type-production') if card else None
+        type_ = (bundle or production)
+        label = type_.get_text(' ', strip=True).lower() if type_ else ''
+        children[urljoin(url, link['href'])] = label
     return children
 
 
@@ -52,6 +49,8 @@ def _infos(root, url):
             continue
         type_audio = source["type"].split(";", 1)[0].strip().lower()
         if type_audio in {"audio/mp3", "audio/mpeg"}:
+            if not source["src"].strip():
+                continue
             lien = urljoin(url, source["src"])
             if lien not in audios:
                 audios.append(lien)
@@ -65,12 +64,16 @@ def _infos(root, url):
         "langues": langues,
         "cdt": _texte(root, ".field-condition-utilisation .field__item"),
         "citation": _texte(root, ".field-citation-ressource .field__item"),
+        "doi": _texte(root, ".id-doi-datacite .field__items"),
     }
 
 
 def _racine(html):
     soup = BeautifulSoup(html, "html.parser")
-    return soup.select_one("article.node--view-mode-full") or soup.select_one("main") or soup
+    root = soup.select_one("article.node--view-mode-full")
+    if root is None or soup.select_one("h1") is None:
+        raise ValueError("Page Canal-U non reconnue ou incomplète ; elle reste à reprendre")
+    return root
 
 
 def parse_page(html: str, url: str = BASE):
@@ -86,7 +89,9 @@ def parse_collection(html: str, url: str = BASE):
     ou les deux. Les audios des cartes ne sont pas attribués à la collection.
     """
     soup = BeautifulSoup(html, "html.parser")
-    root = soup.select_one("article.node--view-mode-full") or soup.select_one("main") or soup
+    root = soup.select_one("article.node--view-mode-full")
+    if root is None or soup.select_one("h1") is None:
+        raise ValueError("Page Canal-U non reconnue ou incomplète ; elle reste à reprendre")
     infos = _infos(root, url)
     pages = {}
     deja_vus = set()
@@ -102,7 +107,7 @@ def parse_collection(html: str, url: str = BASE):
 
     for carte in cartes:
         lien = carte.select_one(".wrapper-content h3 a[href]")
-        if lien is None:
+        if lien is None or not lien["href"].strip():
             continue
         adresse = urljoin(url, lien["href"])
         if adresse == url or adresse in deja_vus:

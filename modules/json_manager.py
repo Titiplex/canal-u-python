@@ -1,16 +1,16 @@
 import json
-from typing import Any
+from pathlib import Path
 
 
 class JsonManager:
     def __init__(self, filename: str):
-        self.filename = filename
+        self.filename = Path(filename)
 
-    def get_json(self) -> Any:
-        with open(self.filename, 'r') as json_file:
-            data = json.load(json_file)
-            return data
+    def get_json(self):
+        with self.filename.open('r', encoding='utf-8') as file:
+            return json.load(file)
 
     def save_json(self, data):
-        with open(self.filename, 'w') as outfile:
-            json.dump(data, outfile)
+        self.filename.parent.mkdir(parents=True, exist_ok=True)
+        with self.filename.open('w', encoding='utf-8') as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
