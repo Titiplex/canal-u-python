@@ -36,6 +36,7 @@ def main(max_search_pages=None, db_path=None):
                     logging.exception('Échec de la page de recherche %s', url)
             bar.increment()
             bar.print()
+        bar.elapsed()
         print('\nTraitement des pages individuelles...')
         queue = deque(db.get_queue())
         bar = lb.LoadingBar(len(queue))
