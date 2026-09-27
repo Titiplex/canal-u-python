@@ -49,9 +49,10 @@ class TimingTests(unittest.TestCase):
                                                                 return_value=0), patch.object(main, '_stage',
                                                                                               side_effect=lambda
                                                                                                       *a: intervals.append(
-                                                                                                      crawling._gate.interval)), contextlib.redirect_stdout(
-                io.StringIO()):
-            main.main(db_path=Path(tmp) / 'data.db', interval=2, search_interval=0.5, page_interval=1.5)
+                                                                                                  crawling._gate.interval)), contextlib.redirect_stdout(
+            io.StringIO()):
+            main.main(measure_sizes=False, db_path=Path(tmp) / 'data.db', interval=2, search_interval=0.5,
+                      page_interval=1.5)
         self.assertEqual(intervals, [0.5, 1.5])
 
     def test_interval_change_preserves_last_request_and_stop(self):

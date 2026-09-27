@@ -49,6 +49,19 @@ class SQLManager:
                                    key   TEXT PRIMARY KEY,
                                    value REAL NOT NULL
                                );
+                               CREATE TABLE IF NOT EXISTS audio_sizes
+                               (
+                                   audio_url    TEXT PRIMARY KEY,
+                                   size_bytes   INTEGER,
+                                   final_url    TEXT,
+                                   status       TEXT    NOT NULL,
+                                   method       TEXT,
+                                   detail       TEXT,
+                                   checked_at   REAL    NOT NULL,
+                                   attempts     INTEGER NOT NULL DEFAULT 0,
+                                   next_attempt REAL
+                               );
+                               CREATE INDEX IF NOT EXISTS audios_source ON audios (audio_url);
                                ''')
         columns = {row[1] for row in self.cur.execute('PRAGMA table_info(audios)')}
         for name in ('lieu', 'doi'):
@@ -90,6 +103,73 @@ class SQLManager:
 
     def add_visited(self, url):
         self.cur.execute('INSERT OR IGNORE INTO visited (url) VALUES (?)', (url,))
+
+    def pending_audio_sizes(self):
+        return [row[0] for row in self.cur.execute('''
+                                                   SELECT DISTINCT a.audio_url
+                                                   FROM audios a
+                                                            LEFT JOIN audio_sizes s ON s.audio_url = a.audio_url
+                                                   WHERE a.audio_url IS NOT NULL
+                                                     AND TRIM(a.audio_url) != ''
+                                                     AND (s.audio_url IS NULL OR (s.status = 'retry' AND s.next_attempt <= ?))
+                                                   ORDER BY a.audio_url''', (time.time(),))]
+
+    def audio_size_ready(self, url):
+        row = self.cur.execute('SELECT status, next_attempt FROM audio_sizes WHERE audio_url=?', (url,)).fetchone()
+        return row is None or (row[0] == 'retry' and row[1] is not None and row[1] <= time.time())
+
+    def save_audio_size(self, url, result):
+        self.cur.execute('''INSERT INTO audio_sizes
+                                (audio_url, size_bytes, final_url, status, method, detail, checked_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(audio_url) DO UPDATE SET size_bytes=excluded.size_bytes,
+                                                                 final_url=excluded.final_url,
+                                                                 status=excluded.status,
+                                                                 method=excluded.method,
+                                                                 detail=excluded.detail,
+                                                                 checked_at=excluded.checked_at,
+                                                                 next_attempt=NULL''',
+                         (url, result['size_bytes'], result['final_url'], result['status'],
+                          result['method'], result['detail'], time.time()))
+
+    def defer_audio_size(self, url, error):
+        row = self.cur.execute('SELECT attempts FROM audio_sizes WHERE audio_url=?', (url,)).fetchone()
+        attempts = (row[0] if row else 0) + 1
+        delay = max(getattr(error, 'delay', 60), min(3600, 60 * 2 ** min(attempts - 1, 10)))
+        deadline = time.time() + delay
+        self.cur.execute('''INSERT INTO audio_sizes
+                                (audio_url, status, detail, checked_at, attempts, next_attempt)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(audio_url) DO UPDATE SET status=excluded.status,
+                                                                 detail=excluded.detail,
+                                                                 checked_at=excluded.checked_at,
+                                                                 attempts=excluded.attempts,
+                                                                 next_attempt=excluded.next_attempt''',
+                         (url, 'retry' if attempts < 5 else 'suspended', str(error)[:2000],
+                          time.time(), attempts, deadline if attempts < 5 else None))
+        if getattr(error, 'blocked', False):
+            self.cur.execute("""INSERT INTO crawl_state
+                                VALUES ('pause_until', ?)
+                                ON CONFLICT(key) DO UPDATE SET value=MAX(value, excluded.value)""", (deadline,))
+        self.commit()
+
+    def next_audio_size_retry(self):
+        row = self.cur.execute("SELECT MIN(next_attempt) FROM audio_sizes WHERE status='retry'").fetchone()
+        return max(row[0], self.pause_until()) if row[0] is not None else None
+
+    def audio_size_summary(self):
+        rows = self.cur.execute('''SELECT COALESCE(s.status, 'pending'),
+                                          COUNT(*),
+                                          COALESCE(SUM(CASE WHEN s.status = 'known' THEN s.size_bytes ELSE 0 END), 0)
+                                   FROM (SELECT DISTINCT audio_url
+                                         FROM audios
+                                         WHERE audio_url IS NOT NULL
+                                           AND TRIM(audio_url) != '') a
+                                            LEFT JOIN audio_sizes s ON a.audio_url = s.audio_url
+                                   GROUP BY s.status''').fetchall()
+        counts = {status: count for status, count, _ in rows}
+        return dict(total=sum(counts.values()), known=counts.get('known', 0),
+                    known_bytes=sum(size for _, _, size in rows), statuses=counts)
 
     def is_visited(self, url):
         return self.cur.execute('SELECT 1 FROM visited WHERE url = ?', (url,)).fetchone() is not None

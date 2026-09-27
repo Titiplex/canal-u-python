@@ -47,8 +47,8 @@ class ProjectTests(unittest.TestCase):
 
             with patch.object(crawling, 'get_results_count', return_value=1), patch.object(crawling, 'crawl',
                                                                                            side_effect=fetch), contextlib.redirect_stdout(
-                    io.StringIO()), self.assertLogs(level='ERROR'):
-                main.main(db_path=path)
+                io.StringIO()), self.assertLogs(level='ERROR'):
+                main.main(measure_sizes=False, db_path=path)
             with contextlib.closing(sqlite3.connect(path)) as conn, conn:
                 self.assertEqual(conn.execute('SELECT COUNT(*) FROM audios').fetchone()[0], 3)
                 self.assertEqual(conn.execute('SELECT url FROM queue').fetchall(), [(BASE + '/bad',)])
@@ -59,9 +59,10 @@ class ProjectTests(unittest.TestCase):
                 conn.execute('UPDATE retry_schedule SET next_attempt=0')
             with patch.object(crawling, 'get_results_count', return_value=1), patch.object(crawling, 'crawl',
                                                                                            return_value=page(
-                                                                                                   audio(4))) as fetch2, contextlib.redirect_stdout(
-                    io.StringIO()):
-                main.main(db_path=path)
+                                                                                               audio(
+                                                                                                   4))) as fetch2, contextlib.redirect_stdout(
+                io.StringIO()):
+                main.main(measure_sizes=False, db_path=path)
             fetch2.assert_called_once_with(BASE + '/bad')
             with contextlib.closing(sqlite3.connect(path)) as conn, conn:
                 self.assertEqual(conn.execute('SELECT COUNT(*) FROM audios').fetchone()[0], 4)
@@ -81,10 +82,10 @@ class ProjectTests(unittest.TestCase):
 
             with patch.object(crawling, 'get_results_count', return_value=0), patch.object(crawling, 'crawl',
                                                                                            return_value=page(
-                                                                                                   audio(1))), patch.object(
-                    SQLManager, 'create_audio', fail_after_insert), contextlib.redirect_stdout(
-                    io.StringIO()), self.assertLogs(level='ERROR'):
-                main.main(db_path=path)
+                                                                                               audio(1))), patch.object(
+                SQLManager, 'create_audio', fail_after_insert), contextlib.redirect_stdout(
+                io.StringIO()), self.assertLogs(level='ERROR'):
+                main.main(measure_sizes=False, db_path=path)
             with contextlib.closing(sqlite3.connect(path)) as conn, conn:
                 self.assertEqual(conn.execute('SELECT COUNT(*) FROM audios').fetchone()[0], 0)
                 self.assertEqual(conn.execute('SELECT COUNT(*) FROM visited').fetchone()[0], 0)

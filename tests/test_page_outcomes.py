@@ -63,8 +63,8 @@ class PageOutcomeTests(unittest.TestCase):
 
             with patch.object(crawling, 'crawl', side_effect=fetch), patch.object(crawling,
                                                                                   'get_results_count') as count, contextlib.redirect_stdout(
-                    io.StringIO()), self.assertLogs(level='WARNING'):
-                main.main(0, dbpath, interval=0)
+                io.StringIO()), self.assertLogs(level='WARNING'):
+                main.main(0, dbpath, measure_sizes=False, interval=0)
                 count.assert_not_called()
             with contextlib.closing(SQLManager(dbpath)) as db:
                 self.assertEqual(db.get_queue(), [(BASE + '/timeout', '')])
@@ -79,7 +79,7 @@ class PageOutcomeTests(unittest.TestCase):
             self.assertEqual(len(list((Path(tmp) / 'pages_a_verifier').glob('*.html'))), 1)
             with patch.object(crawling, 'crawl', return_value=page()) as fetch_again, contextlib.redirect_stdout(
                     io.StringIO()):
-                main.main(0, dbpath, interval=0)
+                main.main(0, dbpath, measure_sizes=False, interval=0)
             fetch_again.assert_called_once_with(BASE + '/timeout')
 
     def test_upgrade_only_old_parser_errors_once_including_suspended(self):

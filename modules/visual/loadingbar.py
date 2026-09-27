@@ -11,8 +11,9 @@ def duration(seconds):
 
 
 class LoadingBar:
-    def __init__(self, total: int):
+    def __init__(self, total: int, unit='page'):
         self.total = max(0, total)
+        self.unit = unit
         self.point = 0
         self.start_time = time.monotonic()
         self._last_print = None
@@ -41,7 +42,7 @@ class LoadingBar:
         rate = self.point / elapsed if elapsed > 0 else 0
         text = (f'[{"=" * filled}{" " * (20 - filled)}] {pct:6.2f}% '
                 f'{self.point}/{self.total} | Écoulé : {duration(elapsed)} '
-                f'| Restant : {remaining} | Fin estimée : {finish} | {rate:.2f} page/s')
+                f'| Restant : {remaining} | Fin estimée : {finish} | {rate:.2f} {self.unit}/s')
         sys.stdout.write('\r' + text.ljust(self._width))
         self._width = len(text)
         sys.stdout.flush()

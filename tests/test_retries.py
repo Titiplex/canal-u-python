@@ -26,7 +26,7 @@ class RetryTests(unittest.TestCase):
         with patch.object(self.client, '_page', None), patch.object(self.client, 'session', session), patch.object(
                 crawling._gate, 'pace'), patch.object(self.client, '_browser_fetch',
                                                       return_value='resolved') as browser, contextlib.redirect_stdout(
-                io.StringIO()):
+            io.StringIO()):
             self.assertEqual(self.client.crawl('https://example.test/one'), '<h1>ok</h1>')
             browser.assert_not_called()
             self.assertEqual(self.client.crawl('https://example.test/two'), 'resolved')
@@ -77,13 +77,13 @@ class RetryTests(unittest.TestCase):
             path = Path(tmp) / 'data.db'
             with patch.object(crawling, 'get_results_count',
                               side_effect=crawling.RetryLater('Challenge', 900)), contextlib.redirect_stdout(
-                    io.StringIO()), self.assertLogs(level='ERROR'):
-                deadline = main.main(db_path=path)
+                io.StringIO()), self.assertLogs(level='ERROR'):
+                deadline = main.main(measure_sizes=False, db_path=path)
             self.assertGreater(deadline, time.time())
             with patch.object(crawling, 'get_results_count') as count, patch.object(crawling,
                                                                                     'crawl') as fetch, contextlib.redirect_stdout(
-                    io.StringIO()):
-                self.assertEqual(main.main(db_path=path), deadline)
+                io.StringIO()):
+                self.assertEqual(main.main(measure_sizes=False, db_path=path), deadline)
                 count.assert_not_called()
                 fetch.assert_not_called()
 

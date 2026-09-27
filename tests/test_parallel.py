@@ -61,8 +61,8 @@ class ParallelTests(unittest.TestCase):
                 search = f'http://127.0.0.1:{server.server_port}/recherche?page='
                 with patch.object(crawling, 'SEARCH_URL', search), patch.object(crawling, 'USE_BROWSER_FALLBACK',
                                                                                 False), contextlib.redirect_stdout(
-                        io.StringIO()):
-                    main.main(db_path=path, search_workers=2, page_workers=2, interval=0.01)
+                    io.StringIO()):
+                    main.main(measure_sizes=False, db_path=path, search_workers=2, page_workers=2, interval=0.01)
                 with contextlib.closing(sqlite3.connect(path)) as db:
                     self.assertEqual(db.execute('SELECT COUNT(*) FROM audios').fetchone()[0], 3)
                     self.assertEqual(db.execute('SELECT COUNT(*) FROM queue').fetchone()[0], 0)
@@ -117,8 +117,8 @@ class ParallelTests(unittest.TestCase):
                                                                                Session), patch.object(crawling,
                                                                                                       'get_results_count',
                                                                                                       return_value=2), patch.object(
-                    crawling, 'crawl', side_effect=fetch), contextlib.redirect_stdout(io.StringIO()):
-                main.main(db_path=path, search_workers=2, page_workers=2)
+                crawling, 'crawl', side_effect=fetch), contextlib.redirect_stdout(io.StringIO()):
+                main.main(measure_sizes=False, db_path=path, search_workers=2, page_workers=2)
             with contextlib.closing(sqlite3.connect(path)) as db:
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM audios').fetchone()[0], 3)
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM visited').fetchone()[0], 5)
@@ -148,8 +148,8 @@ class ParallelTests(unittest.TestCase):
                 db.commit()
             with patch.object(crawling, 'get_results_count', return_value=0), patch.object(crawling, 'crawl',
                                                                                            side_effect=fetch), contextlib.redirect_stdout(
-                    io.StringIO()), self.assertLogs(level='ERROR'):
-                main.main(db_path=path, page_workers=2)
+                io.StringIO()), self.assertLogs(level='ERROR'):
+                main.main(measure_sizes=False, db_path=path, page_workers=2)
             with contextlib.closing(SQLManager(path)) as db:
                 self.assertEqual({u for u, _ in db.get_queue()}, {BASE + '/a', BASE + '/c'})
                 self.assertTrue(db.is_visited(BASE + '/b'))

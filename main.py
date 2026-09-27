@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from queue import Empty
 
-from modules import crawling, parsing
+from modules import audio_sizes, crawling, parsing
 from modules import db_manager as dbm
 from modules.process_lock import DatabaseRunLock
 from modules.visual import loadingbar as lb
@@ -29,11 +29,11 @@ def _page(url):
         raise
 
 
-def _stage(urls, workers, fetch, save, defer):
+def _stage(urls, workers, fetch, save, defer, priority=None, unit='page'):
     """Seul le coordinateur appelle save/defer ; au plus workers tâches en vol."""
     pending = deque(dict.fromkeys(urls))
     scheduled = set(pending)
-    bar = lb.LoadingBar(len(pending))
+    bar = lb.LoadingBar(len(pending), unit=unit)
     bar.print()
     active = 0
     with WorkerPool(workers, fetch) as pool:
@@ -65,7 +65,10 @@ def _stage(urls, workers, fetch, save, defer):
                     for child in added:
                         if child not in scheduled:
                             scheduled.add(child)
-                            pending.append(child)
+                            if priority and priority(child):
+                                pending.appendleft(child)
+                            else:
+                                pending.append(child)
                             bar.total += 1
             bar.increment()
             bar.print()
@@ -75,7 +78,7 @@ def _stage(urls, workers, fetch, save, defer):
 
 
 def main(max_search_pages=None, db_path=None, search_workers=4, page_workers=4,
-         interval=None, search_interval=None, page_interval=None):
+         interval=None, search_interval=None, page_interval=None, measure_sizes=True):
     if search_workers < 1 or page_workers < 1:
         raise ValueError('Le nombre de workers doit être >= 1')
     for value in (interval, search_interval, page_interval):
@@ -87,16 +90,24 @@ def main(max_search_pages=None, db_path=None, search_workers=4, page_workers=4,
     path = Path(db_path) if db_path else Path(__file__).resolve().parent / '.cache' / 'data.db'
     with DatabaseRunLock(path):
         crawling.configure(search_interval)
-        return _main(max_search_pages, path, search_workers, page_workers, page_interval)
+        return _main(max_search_pages, path, search_workers, page_workers, page_interval, measure_sizes)
 
 
-def _main(max_search_pages, path, search_workers, page_workers, page_interval):
+def _main(max_search_pages, path, search_workers, page_workers, page_interval, measure_sizes):
     db = dbm.SQLManager(path)
     print(f'Base SQLite : {db.path.resolve()}')
     print(f'Workers recherche : {search_workers} ; pages : {page_workers}')
     restored = db.upgrade_parser()
     if restored:
         print(f'Anciennes erreurs de parsing réactivées : {restored}')
+
+    def next_retry():
+        deadlines = [db.next_retry()]
+        if measure_sizes:
+            deadlines.append(db.next_audio_size_retry())
+            if crawling.stopped() and db.pending_audio_sizes():
+                deadlines.append(db.pause_until())
+        return min((date for date in deadlines if date is not None), default=None)
 
     def defer(kind, url, error):
         db.rollback()
@@ -146,10 +157,36 @@ def _main(max_search_pages, path, search_workers, page_workers, page_interval):
         db.commit()
         return ready
 
+    def fetch_task(task):
+        kind, url = task
+        return _page(url) if kind == 'page' else audio_sizes.probe(url)
+
+    def save_task(task, value):
+        kind, url = task
+        if kind == 'size':
+            db.save_audio_size(url, value)
+            db.commit()
+            return []
+        children = save_page(url, value)
+        # Métadonnées déjà validées : un échec de mesure ne les annule pas.
+        sizes = [('size', audio) for audio in value['audios'] if db.audio_size_ready(audio)]
+        return [('page', child) for child in children] + sizes
+
+    def defer_task(task, error):
+        kind, url = task
+        if kind == 'page':
+            defer(kind, url, error)
+        else:
+            db.rollback()
+            if isinstance(error, crawling.RetryLater) and error.blocked:
+                crawling.stop()
+            db.defer_audio_size(url, error)
+            logging.error('Taille à reprendre : %s : %s', url, error)
+
     try:
         if db.pause_until() > time.time():
             print('Pause globale jusqu’à', datetime.fromtimestamp(db.pause_until()).strftime('%H:%M:%S'))
-            return db.next_retry()
+            return max(db.pause_until(), next_retry() or 0)
         count_url = crawling.SEARCH_URL + '0'
         count = 0
         if max_search_pages != 0 and db.retry_ready('count', count_url):
@@ -160,7 +197,7 @@ def _main(max_search_pages, path, search_workers, page_workers, page_interval):
             except Exception as error:
                 defer('count', count_url, error)
                 if crawling.stopped():
-                    return db.next_retry()
+                    return next_retry()
         crawling.close()  # Le client du compteur n'est pas partagé avec les workers.
         if max_search_pages is not None:
             count = min(count, max(0, max_search_pages))
@@ -169,17 +206,28 @@ def _main(max_search_pages, path, search_workers, page_workers, page_interval):
         _stage((url for url in urls if not db.is_visited(url) and db.retry_ready('search', url)),
                search_workers, _search, save_search, lambda u, e: defer('search', u, e))
         if crawling.stopped():
-            return db.next_retry()
+            return next_retry()
         crawling.set_interval(page_interval)
-        print('Traitement des pages individuelles...')
-        _stage((url for url, _ in db.get_queue() if db.retry_ready('page', url)),
-               page_workers, _page, save_page, lambda u, e: defer('page', u, e))
+        if measure_sizes:
+            print('Traitement des pages individuelles et tailles audio...')
+            tasks = [('page', url) for url, _ in db.get_queue() if db.retry_ready('page', url)]
+            tasks += [('size', url) for url in db.pending_audio_sizes()]
+            _stage(tasks, page_workers, fetch_task, save_task, defer_task,
+                   priority=lambda task: task[0] == 'size', unit='tâche')
+        else:
+            print('Traitement des pages individuelles...')
+            _stage((url for url, _ in db.get_queue() if db.retry_ready('page', url)),
+                   page_workers, _page, save_page, lambda u, e: defer('page', u, e))
         print(f'Pages restant en file : {db.get_queue_size()}. Reprises suspendues : {db.suspended_count()}')
         print('Résultats enregistrés :', db.outcome_counts())
-        return db.next_retry()
+        return next_retry()
     finally:
-        db.close()
-        crawling.close()
+        try:
+            if measure_sizes:
+                audio_sizes.report(db)
+        finally:
+            db.close()
+            crawling.close()
 
 
 if __name__ == '__main__':
@@ -196,6 +244,7 @@ if __name__ == '__main__':
     parser.add_argument('--page-interval', type=float, default=None)
     parser.add_argument('--watch', action='store_true')
     parser.add_argument('--no-browser', action='store_true')
+    parser.add_argument('--no-audio-sizes', action='store_true', help='Désactiver la mesure des tailles pendant le crawl')
     parser.add_argument('--trace-http', action='store_true')
     args = parser.parse_args()
     search_workers = args.search_workers if args.search_workers is not None else args.workers
@@ -208,7 +257,8 @@ if __name__ == '__main__':
     try:
         while True:
             deadline = main(args.max_search_pages, args.db, search_workers, page_workers,
-                            args.interval, args.search_interval, args.page_interval)
+                            args.interval, args.search_interval, args.page_interval,
+                            measure_sizes=not args.no_audio_sizes)
             if deadline is None:
                 break
             print('Prochaine reprise possible :', datetime.fromtimestamp(deadline).strftime('%Y-%m-%d %H:%M:%S'))
