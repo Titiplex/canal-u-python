@@ -44,6 +44,10 @@ def _retry_delay(value, default=300):
             return default
 
 
+class PermanentHTTPError(RuntimeError):
+    """404/410 : URL indisponible, pas de reprise automatique."""
+
+
 class CrawlCancelled(RuntimeError):
     """Appel non commencé : conserver son URL pour la reprise."""
 
@@ -80,6 +84,11 @@ def configure(interval=None):
     _gate = RequestGate(MIN_INTERVAL if interval is None else interval)
 
 
+def set_interval(interval):
+    with _gate.lock:
+        _gate.interval = interval
+
+
 def stop():
     _gate.stopped.set()
 
@@ -92,7 +101,7 @@ def _challenge(html):
     if 'global-search-results-counter' in html or 'node--view-mode-full' in html:
         return False
     soup = BeautifulSoup(html, 'html.parser')
-    if soup.select_one('#global-search-results-counter, article.node--view-mode-full'):
+    if soup.select_one('#global-search-results-counter, .node--view-mode-full, .taxonomy-term'):
         return False
     text = soup.get_text(' ', strip=True).lower()[:1500]
     return any(word in text for word in ('challenge', 'verify you are human', 'checking your browser', 'just a moment'))
@@ -173,13 +182,16 @@ class Client:
                 # Ne jamais retourner l'ancien document si la navigation a échoué.
                 if self._page.url != url:
                     raise RetryLater('Navigation non terminée vers la page demandée', delay=900)
+            if response and response.status in (404, 410):
+                raise PermanentHTTPError(f'HTTP {response.status} : {url}')
             if response and (response.status == 429 or response.status >= 500):
                 raise RetryLater(f'Navigateur HTTP {response.status}',
-                                 _retry_delay(response.headers.get('retry-after')))
+                                 _retry_delay(response.headers.get('retry-after')),
+                                 blocked=response.status == 429 or bool(response.headers.get('retry-after')))
             if response and response.status >= 400 and not _challenge(self._page.content()):
                 raise RetryLater(f'Navigateur HTTP {response.status} : accès refusé', delay=900)
             selector = '#global-search-results-counter' if urlsplit(url).path.rstrip(
-                '/') == '/recherche' else 'article.node--view-mode-full'
+                '/') == '/recherche' else '.node--view-mode-full, .taxonomy-term, main h1, [role="main"] h1'
             # Attendre le contenu réel, pas seulement la fin de la page "Challenge".
             # Le code ne clique sur aucun CAPTCHA et ne recharge pas en boucle.
             self._page.wait_for_function(
@@ -219,6 +231,8 @@ class Client:
         if 'charset=' not in response.headers.get('Content-Type', '').lower():
             response.encoding = response.apparent_encoding
         html = response.text
+        if response.status_code in (404, 410):
+            raise PermanentHTTPError(f'HTTP {response.status_code} : {url}')
         if response.status_code == 429:
             # Un délai explicite doit être respecté, sans essayer un autre client.
             raise RetryLater('HTTP 429 : trop de requêtes', _retry_delay(response.headers.get('Retry-After')))
@@ -233,8 +247,9 @@ class Client:
         if response.status_code == 403:
             raise RetryLater('HTTP 403 sans challenge reconnu', _retry_delay(response.headers.get('Retry-After'), 900))
         if response.status_code >= 500:
-            raise RetryLater(f'HTTP {response.status} : serveur indisponible',
-                             _retry_delay(response.headers.get('Retry-After')))
+            raise RetryLater(f'HTTP {response.status_code} : serveur indisponible',
+                             _retry_delay(response.headers.get('Retry-After')),
+                             blocked=bool(response.headers.get('Retry-After')))
         response.raise_for_status()
         return html
 

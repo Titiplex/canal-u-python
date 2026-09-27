@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import time
 from collections import deque
@@ -20,7 +21,12 @@ def _search(url):
 
 
 def _page(url):
-    return parsing.parse_collection(crawling.crawl(url), url)[1]
+    html = crawling.crawl(url)
+    try:
+        return parsing.parse_collection(html, url)[1]
+    except parsing.UnrecognizedPage as error:
+        error.html = html
+        raise
 
 
 def _stage(urls, workers, fetch, save, defer):
@@ -40,6 +46,7 @@ def _stage(urls, workers, fetch, save, defer):
             try:
                 url, value, error = pool.results.get(timeout=0.2)
             except Empty:
+                bar.print(paused=crawling.stopped())
                 continue
             active -= 1
             if isinstance(error, crawling.CrawlCancelled):
@@ -63,27 +70,52 @@ def _stage(urls, workers, fetch, save, defer):
             bar.increment()
             bar.print()
     # Même après un blocage, tous les résultats déjà en vol ont été drainés.
-    print()
+    bar.print(force=True, paused=crawling.stopped())
+    bar.elapsed()
 
 
-def main(max_search_pages=None, db_path=None, search_workers=4, page_workers=4, interval=None):
+def main(max_search_pages=None, db_path=None, search_workers=4, page_workers=4,
+         interval=None, search_interval=None, page_interval=None):
     if search_workers < 1 or page_workers < 1:
         raise ValueError('Le nombre de workers doit être >= 1')
-    if interval is not None and (not 0 <= interval < float('inf')):
-        raise ValueError('Intervalle invalide')
+    for value in (interval, search_interval, page_interval):
+        if value is not None and not 0 <= value < float('inf'):
+            raise ValueError('Intervalle invalide')
+    base_interval = crawling.MIN_INTERVAL if interval is None else interval
+    search_interval = base_interval if search_interval is None else search_interval
+    page_interval = base_interval if page_interval is None else page_interval
     path = Path(db_path) if db_path else Path(__file__).resolve().parent / '.cache' / 'data.db'
     with DatabaseRunLock(path):
-        crawling.configure(interval)
-        return _main(max_search_pages, path, search_workers, page_workers)
+        crawling.configure(search_interval)
+        return _main(max_search_pages, path, search_workers, page_workers, page_interval)
 
 
-def _main(max_search_pages, path, search_workers, page_workers):
+def _main(max_search_pages, path, search_workers, page_workers, page_interval):
     db = dbm.SQLManager(path)
     print(f'Base SQLite : {db.path.resolve()}')
     print(f'Workers recherche : {search_workers} ; pages : {page_workers}')
+    restored = db.upgrade_parser()
+    if restored:
+        print(f'Anciennes erreurs de parsing réactivées : {restored}')
 
     def defer(kind, url, error):
         db.rollback()
+        if kind == 'page' and isinstance(error, (parsing.UnrecognizedPage, crawling.PermanentHTTPError)):
+            status = 'a_verifier' if isinstance(error, parsing.UnrecognizedPage) else 'introuvable'
+            detail = str(error)
+            if getattr(error, 'html', None):
+                folder = db.path.parent / 'pages_a_verifier'
+                folder.mkdir(parents=True, exist_ok=True)
+                snapshot = folder / (hashlib.sha256(url.encode()).hexdigest() + '.html')
+                snapshot.write_text(error.html, encoding='utf-8')
+                detail += f' ; HTML : {snapshot}'
+            db.record_outcome(url, status, detail)
+            db.add_visited(url)
+            db.remove_from_queue(url)
+            db.clear_retry(kind, url)
+            db.commit()
+            logging.warning('%s : %s ; pas de reprise automatique', url, detail)
+            return
         blocked = isinstance(error, crawling.RetryLater) and error.blocked
         if blocked:
             crawling.stop()
@@ -105,6 +137,9 @@ def _main(max_search_pages, path, search_workers, page_workers):
                             metadata['cdt'], metadata['lieu'], metadata['doi'])
         db.add_visited(url)
         added = db.save_to_queue(metadata['pages'])
+        status = metadata.get('status', 'exploitable' if metadata['audios'] or metadata['pages'] else 'sans_contenu')
+        db.record_outcome(url, status,
+                          f"{len(metadata['audios'])} audio(s), {len(metadata['pages'])} lien(s)")
         db.remove_from_queue(url)
         db.clear_retry('page', url)
         ready = [child for child, _ in added if db.retry_ready('page', child)]
@@ -117,7 +152,7 @@ def _main(max_search_pages, path, search_workers, page_workers):
             return db.next_retry()
         count_url = crawling.SEARCH_URL + '0'
         count = 0
-        if db.retry_ready('count', count_url):
+        if max_search_pages != 0 and db.retry_ready('count', count_url):
             try:
                 count = crawling.get_results_count()
                 db.clear_retry('count', count_url)
@@ -135,10 +170,12 @@ def _main(max_search_pages, path, search_workers, page_workers):
                search_workers, _search, save_search, lambda u, e: defer('search', u, e))
         if crawling.stopped():
             return db.next_retry()
+        crawling.set_interval(page_interval)
         print('Traitement des pages individuelles...')
         _stage((url for url, _ in db.get_queue() if db.retry_ready('page', url)),
                page_workers, _page, save_page, lambda u, e: defer('page', u, e))
         print(f'Pages restant en file : {db.get_queue_size()}. Reprises suspendues : {db.suspended_count()}')
+        print('Résultats enregistrés :', db.outcome_counts())
         return db.next_retry()
     finally:
         db.close()
@@ -155,6 +192,8 @@ if __name__ == '__main__':
     parser.add_argument('--search-workers', type=int, default=None)
     parser.add_argument('--page-workers', type=int, default=None)
     parser.add_argument('--interval', type=float, default=2.0, help='Intervalle GLOBAL entre départs HTTP')
+    parser.add_argument('--search-interval', type=float, default=None)
+    parser.add_argument('--page-interval', type=float, default=None)
     parser.add_argument('--watch', action='store_true')
     parser.add_argument('--no-browser', action='store_true')
     parser.add_argument('--trace-http', action='store_true')
@@ -168,7 +207,8 @@ if __name__ == '__main__':
     crawling.TRACE_HTTP = args.trace_http
     try:
         while True:
-            deadline = main(args.max_search_pages, args.db, search_workers, page_workers, args.interval)
+            deadline = main(args.max_search_pages, args.db, search_workers, page_workers,
+                            args.interval, args.search_interval, args.page_interval)
             if deadline is None:
                 break
             print('Prochaine reprise possible :', datetime.fromtimestamp(deadline).strftime('%Y-%m-%d %H:%M:%S'))

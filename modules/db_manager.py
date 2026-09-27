@@ -56,6 +56,38 @@ class SQLManager:
                 self.cur.execute(f'ALTER TABLE audios ADD COLUMN {name} TEXT')
         self.conn.commit()
 
+    def upgrade_parser(self):
+        """Réactiver une seule fois les erreurs de l'ancien sélecteur."""
+        self.cur.execute('''CREATE TABLE IF NOT EXISTS page_outcomes
+                            (
+                                url        TEXT PRIMARY KEY,
+                                status     TEXT NOT NULL,
+                                detail     TEXT NOT NULL,
+                                checked_at REAL NOT NULL
+                            )''')
+        if self.cur.execute("SELECT 1 FROM crawl_state WHERE key='parser_v2'").fetchone():
+            return 0
+        self.cur.execute("""DELETE
+                            FROM retry_schedule
+                            WHERE kind = 'page'
+                              AND error LIKE 'Page Canal-U non reconnue ou incomplète%'
+                              AND url IN (SELECT url FROM queue)""")
+        count = self.cur.rowcount
+        self.cur.execute("INSERT INTO crawl_state(key,value) VALUES ('parser_v2',1)")
+        self.commit()
+        return count
+
+    def record_outcome(self, url, status, detail=''):
+        self.cur.execute('''INSERT INTO page_outcomes
+                            VALUES (?, ?, ?, ?)
+                            ON CONFLICT(url) DO UPDATE SET status=excluded.status,
+                                                           detail=excluded.detail,
+                                                           checked_at=excluded.checked_at''',
+                         (url, status, detail, time.time()))
+
+    def outcome_counts(self):
+        return dict(self.cur.execute('SELECT status, COUNT(*) FROM page_outcomes GROUP BY status'))
+
     def add_visited(self, url):
         self.cur.execute('INSERT OR IGNORE INTO visited (url) VALUES (?)', (url,))
 
