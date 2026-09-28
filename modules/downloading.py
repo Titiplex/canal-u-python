@@ -31,21 +31,26 @@ def slug(value, limit=48):
 
 
 def language_folder(labels):
-    aliases = {'fr': 'francais', 'fra': 'francais', 'fre': 'francais', 'french': 'francais',
-               'en': 'anglais', 'eng': 'anglais', 'english': 'anglais',
-               'es': 'espagnol', 'spa': 'espagnol', 'spanish': 'espagnol',
-               'de': 'allemand', 'deu': 'allemand', 'ger': 'allemand',
-               'it': 'italien', 'ita': 'italien'}
-    names = sorted({aliases.get(slug(v), slug(v)) for label in labels
-                    for v in (label or '').split(';') if v.strip()})
-    if not names:
-        return 'langue_inconnue'
-    if len(names) == 1:
-        return names[0]
-    combined = '-'.join(names)
-    if len(combined) > 100:
-        combined = combined[:80] + '-' + hashlib.sha256(combined.encode()).hexdigest()[:12]
-    return 'multilingue/' + combined
+    values = sorted({
+        value.strip()
+        for value in labels
+        if value and value.strip()
+    })
+
+    name = " + ".join(values) or "langue_inconnue"
+
+    # Caractères interdits dans les dossiers Windows.
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(' .')
+    name = name or "langue_inconnue"
+
+    if re.fullmatch(
+            r'(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\..*)?',
+            name,
+            re.IGNORECASE,
+    ):
+        name = "_" + name
+
+    return name
 
 
 def atomic_json(path, data):
