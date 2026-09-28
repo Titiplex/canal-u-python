@@ -116,7 +116,7 @@ class Client:
         self._use_browser = False
         self._runtime = self._browser = self._page = None
 
-    def _image_challenge(self, response):
+    def _image_challenge(self, response, refresh_request=None):
         """Charger l'image puis rafraîchir, comme le demande la page reçue.
 
         Limité au modèle réellement observé sur Canal-U : aucun JavaScript exécuté,
@@ -159,6 +159,9 @@ class Client:
         finally:
             image_response.close()
         _gate.sleep(max(1.0, float(value)))
+        if refresh_request is not None:
+            # Le téléchargeur fournit un GET en streaming, sans lecture du fichier.
+            return refresh_request(response.url)
         _gate.pace()
         return self.session.get(response.url, timeout=(10, 30))
 
