@@ -91,12 +91,33 @@ class SQLManager:
         return count
 
     def record_outcome(self, url, status, detail=''):
-        self.cur.execute('''INSERT INTO page_outcomes
-                            VALUES (?, ?, ?, ?)
-                            ON CONFLICT(url) DO UPDATE SET status=excluded.status,
-                                                           detail=excluded.detail,
-                                                           checked_at=excluded.checked_at''',
-                         (url, status, detail, time.time()))
+        self.upsert('page_outcomes', dict(url=url),
+                    dict(status=status, detail=detail, checked_at=time.time()))
+
+    def upsert(self, table, keys, values, update_only=None):
+        """UPDATE puis INSERT si absent, compatible SQLite 3.22, sans commit.
+
+        Noms de table/colonnes internes uniquement ; toutes les données sont liées.
+        L'UPDATE ouvre la transaction d'écriture avant de tester l'existence :
+        un autre écrivain ne peut pas insérer entre les deux requêtes.
+        Les colonnes non fournies sont préservées (contrairement à REPLACE).
+        """
+        changes = dict(values, **(update_only or {}))
+        assignments = ', '.join('"{}"=?'.format(name) for name in changes)
+        where = ' AND '.join('"{}"=?'.format(name) for name in keys)
+        self.cur.execute('UPDATE "{}" SET {} WHERE {}'.format(table, assignments, where),
+                         tuple(changes.values()) + tuple(keys.values()))
+        if self.cur.rowcount == 0:
+            inserted = dict(keys, **values)
+            columns = ', '.join('"{}"'.format(name) for name in inserted)
+            placeholders = ', '.join('?' for _ in inserted)
+            self.cur.execute('INSERT INTO "{}" ({}) VALUES ({})'.format(table, columns, placeholders),
+                             tuple(inserted.values()))
+
+    def extend_pause(self, deadline):
+        """Allonger la pause globale sans raccourcir une pause déjà enregistrée."""
+        self.cur.execute("INSERT OR IGNORE INTO crawl_state(key,value) VALUES ('pause_until',?)", (deadline,))
+        self.cur.execute("UPDATE crawl_state SET value=MAX(value,?) WHERE key='pause_until'", (deadline,))
 
     def outcome_counts(self):
         return dict(self.cur.execute('SELECT status, COUNT(*) FROM page_outcomes GROUP BY status'))
@@ -119,38 +140,22 @@ class SQLManager:
         return row is None or (row[0] == 'retry' and row[1] is not None and row[1] <= time.time())
 
     def save_audio_size(self, url, result):
-        self.cur.execute('''INSERT INTO audio_sizes
-                                (audio_url, size_bytes, final_url, status, method, detail, checked_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(audio_url) DO UPDATE SET size_bytes=excluded.size_bytes,
-                                                                 final_url=excluded.final_url,
-                                                                 status=excluded.status,
-                                                                 method=excluded.method,
-                                                                 detail=excluded.detail,
-                                                                 checked_at=excluded.checked_at,
-                                                                 next_attempt=NULL''',
-                         (url, result['size_bytes'], result['final_url'], result['status'],
-                          result['method'], result['detail'], time.time()))
+        self.upsert('audio_sizes', dict(audio_url=url),
+                    dict(size_bytes=result['size_bytes'], final_url=result['final_url'],
+                         status=result['status'], method=result['method'], detail=result['detail'],
+                         checked_at=time.time()), update_only=dict(next_attempt=None))
 
     def defer_audio_size(self, url, error):
         row = self.cur.execute('SELECT attempts FROM audio_sizes WHERE audio_url=?', (url,)).fetchone()
         attempts = (row[0] if row else 0) + 1
         delay = max(getattr(error, 'delay', 60), min(3600, 60 * 2 ** min(attempts - 1, 10)))
         deadline = time.time() + delay
-        self.cur.execute('''INSERT INTO audio_sizes
-                                (audio_url, status, detail, checked_at, attempts, next_attempt)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(audio_url) DO UPDATE SET status=excluded.status,
-                                                                 detail=excluded.detail,
-                                                                 checked_at=excluded.checked_at,
-                                                                 attempts=excluded.attempts,
-                                                                 next_attempt=excluded.next_attempt''',
-                         (url, 'retry' if attempts < 5 else 'suspended', str(error)[:2000],
-                          time.time(), attempts, deadline if attempts < 5 else None))
+        self.upsert('audio_sizes', dict(audio_url=url),
+                    dict(status='retry' if attempts < 5 else 'suspended', detail=str(error)[:2000],
+                         checked_at=time.time(), attempts=attempts,
+                         next_attempt=deadline if attempts < 5 else None))
         if getattr(error, 'blocked', False):
-            self.cur.execute("""INSERT INTO crawl_state
-                                VALUES ('pause_until', ?)
-                                ON CONFLICT(key) DO UPDATE SET value=MAX(value, excluded.value)""", (deadline,))
+            self.extend_pause(deadline)
         self.commit()
 
     def next_audio_size_retry(self):
@@ -237,17 +242,10 @@ class SQLManager:
         seconds = max(delay, min(3600, delay * 2 ** min(attempts - 1, 10)))
         deadline = time.time() + seconds
         next_attempt = deadline if attempts < 5 else None
-        self.cur.execute("""
-                         INSERT INTO retry_schedule(kind, url, attempts, next_attempt, error)
-                         VALUES (?, ?, ?, ?, ?)
-                         ON CONFLICT(kind,url) DO UPDATE SET attempts=excluded.attempts,
-                                                             next_attempt=excluded.next_attempt,
-                                                             error=excluded.error
-                         """, (kind, url, attempts, next_attempt, str(error)[:2000]))
+        self.upsert('retry_schedule', dict(kind=kind, url=url),
+                    dict(attempts=attempts, next_attempt=next_attempt, error=str(error)[:2000]))
         if blocked:
-            self.cur.execute(
-                "INSERT INTO crawl_state(key,value) VALUES ('pause_until',?) ON CONFLICT(key) DO UPDATE SET value=MAX(value,excluded.value)",
-                (deadline,))
+            self.extend_pause(deadline)
         self.commit()
         return next_attempt
 

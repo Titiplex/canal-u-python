@@ -70,16 +70,9 @@ class DownloadState:
 
     def save(self, url, result):
         path = str(self.root / result['file'])
-        self.db.cur.execute('''INSERT INTO downloads
-                                   (output_root, audio_url, status, file_path, size_bytes, updated_at)
-                               VALUES (?, ?, 'done', ?, ?, ?)
-                               ON CONFLICT(output_root,audio_url) DO UPDATE SET status='done',
-                                                                                file_path=excluded.file_path,
-                                                                                size_bytes=excluded.size_bytes,
-                                                                                next_attempt=NULL,
-                                                                                detail='',
-                                                                                updated_at=excluded.updated_at''',
-                            (str(self.root), url, path, result['size_bytes'], time.time()))
+        self.db.upsert('downloads', dict(output_root=str(self.root), audio_url=url),
+                       dict(status='done', file_path=path, size_bytes=result['size_bytes'], updated_at=time.time()),
+                       update_only=dict(next_attempt=None, detail=''))
         self.db.cur.execute('UPDATE audios SET file_name=? WHERE audio_url=?', (path, url))
         self.db.save_audio_size(url, dict(size_bytes=result['size_bytes'], final_url=result['final_url'],
                                           status='known', method='DOWNLOAD', detail='Fichier téléchargé'))
@@ -94,28 +87,18 @@ class DownloadState:
         delay = max(getattr(error, 'delay', 60), min(3600, 60 * 2 ** min(attempts - 1, 10)))
         deadline = time.time() + delay
         status = terminal or ('retry' if attempts < 5 else 'suspended')
-        self.db.cur.execute('''INSERT INTO downloads
-                               (output_root, audio_url, status, attempts, next_attempt, detail, updated_at)
-                               VALUES (?, ?, ?, ?, ?, ?, ?)
-                               ON CONFLICT(output_root,audio_url) DO UPDATE SET status=excluded.status,
-                                                                                attempts=excluded.attempts,
-                                                                                next_attempt=excluded.next_attempt,
-                                                                                detail=excluded.detail,
-                                                                                updated_at=excluded.updated_at''',
-                            (str(self.root), url, status, attempts, deadline if status == 'retry' else None,
-                             str(error)[:2000], time.time()))
+        self.db.upsert('downloads', dict(output_root=str(self.root), audio_url=url),
+                       dict(status=status, attempts=attempts, next_attempt=deadline if status == 'retry' else None,
+                            detail=str(error)[:2000], updated_at=time.time()))
         if getattr(error, 'blocked', False):
-            self.db.cur.execute("""INSERT INTO crawl_state
-                                   VALUES ('pause_until', ?)
-                                   ON CONFLICT(key) DO UPDATE SET value=MAX(value, excluded.value)""", (deadline,))
+            self.db.extend_pause(deadline)
         self.db.commit()
         return status
 
     def next_retry(self):
         clause, params = self._language_filter('downloads.audio_url')
-        value = \
-        self.db.cur.execute("SELECT MIN(next_attempt) FROM downloads WHERE output_root=? AND status='retry'" + clause,
-                            (str(self.root), *params)).fetchone()[0]
+        value = self.db.cur.execute("SELECT MIN(next_attempt) FROM downloads WHERE output_root=? AND status='retry'" + clause,
+                                    (str(self.root), *params)).fetchone()[0]
         return max(value, self.db.pause_until()) if value is not None else None
 
     def reset_failed(self):
@@ -124,8 +107,8 @@ class DownloadState:
                                SET status='pending',
                                    attempts=0,
                                    next_attempt=NULL
-        WHERE output_root = ?
-          AND status IN ('retry', 'suspended', 'invalid')""" + clause, (str(self.root), *params))
+                               WHERE output_root = ?
+                                 AND status IN ('retry', 'suspended', 'invalid')""" + clause, (str(self.root), *params))
         self.db.commit()
 
     def report(self):
