@@ -18,7 +18,8 @@ from modules.process_lock import DatabaseRunLock
 PROJECT = Path(__file__).resolve().parent
 
 
-def run(db_path=None, output=None, workers=4, interval=2.0, watch=False, limit=None, retry_failed=False):
+def run(db_path=None, output=None, workers=4, interval=2.0, watch=False, limit=None, retry_failed=False,
+        languages=None):
     if workers < 1 or not 0 <= interval < float('inf') or (limit is not None and limit < 1):
         raise ValueError('Workers et limite >= 1 ; intervalle fini >= 0')
     path = Path(db_path).resolve() if db_path else PROJECT / '.cache/data.db'
@@ -29,7 +30,7 @@ def run(db_path=None, output=None, workers=4, interval=2.0, watch=False, limit=N
     # Un coordinateur SQLite et un verrou du dossier même avec deux bases différentes.
     with DatabaseRunLock(path), DatabaseRunLock(root / '_state' / 'downloads'), contextlib.closing(
             SQLManager(path)) as db:
-        state = DownloadState(db, root)
+        state = DownloadState(db, root, languages=languages)
         if retry_failed:
             state.reset_failed()
         try:
@@ -72,7 +73,7 @@ def run(db_path=None, output=None, workers=4, interval=2.0, watch=False, limit=N
             crawling.close()
 
 
-if __name__ == '__main__':
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--db', default=None)
     parser.add_argument('--output', default=None, help='Dossier dédié (défaut : corpus_audio dans le projet)')
@@ -83,9 +84,16 @@ if __name__ == '__main__':
     parser.add_argument('--limit', type=int, default=None, help='Maximum de fichiers par passage')
     parser.add_argument('--retry-failed', action='store_true',
                         help='Réactiver erreurs suspendues/non audio (pas les 404/410)')
-    args = parser.parse_args()
+    parser.add_argument('--languages', '--lang', nargs='+', action='extend', default=None,
+                        help='Valeurs exactes du champ lang ; "" pour vide/NULL. Sans option : toutes.')
+    return parser
+
+
+if __name__ == '__main__':
+    args = build_parser().parse_args()
     logging.basicConfig(level=logging.ERROR)
     try:
-        run(args.db, args.output, args.workers, args.interval, args.watch, args.limit, args.retry_failed)
+        run(args.db, args.output, args.workers, args.interval, args.watch, args.limit, args.retry_failed,
+            languages=args.languages)
     except KeyboardInterrupt:
         print('\nArrêt demandé ; téléchargements validés et fichiers partiels conservés.')

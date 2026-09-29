@@ -107,10 +107,23 @@ class DownloadTests(unittest.TestCase):
     def test_download_redirect_language_and_no_second_request(self):
         job = self.job('/redirect')
         result = downloading.download(job, self.root)
-        self.assertTrue(result['file'].startswith('francais/'))
+        self.assertTrue(result['file'].startswith('Français/'))
         self.assertEqual((self.root / result['file']).read_bytes(), DATA)
         downloading.download(job, self.root)
         self.assertEqual([call[0] for call in self.calls], ['/redirect', '/ok'])
+
+    def test_pipeline_language_filter_before_limit_and_resume(self):
+        dbpath = Path(self.tmp.name) / 'filtered.db'
+        with contextlib.closing(SQLManager(dbpath)) as db:
+            for route, lang in [('/english', 'Anglais'), ('/french', 'Français'), ('/unlabelled', '')]:
+                db.create_audio('page', self.base + route, 'Test', '', lang, '', '')
+            db.commit()
+        with contextlib.redirect_stdout(io.StringIO()):
+            download_audios.run(dbpath, self.root, interval=0, limit=1, languages=['Français'])
+            download_audios.run(dbpath, self.root, interval=0, languages=['Français', ''])
+        self.assertEqual([call[0] for call in self.calls], ['/french', '/unlabelled'])
+        with contextlib.closing(SQLManager(dbpath)) as db:
+            self.assertEqual(set(DownloadState(db, self.root).jobs()), {self.base + '/english'})
 
     def test_resume_after_real_connection_interruption(self):
         job = self.job('/interrupt')
@@ -155,9 +168,10 @@ class DownloadTests(unittest.TestCase):
 
     def test_language_union_and_windows_names(self):
         self.assertEqual(downloading.language_folder([]), 'langue_inconnue')
-        self.assertEqual(downloading.language_folder(['fr; Français', 'English']), 'multilingue/anglais-francais')
+        self.assertEqual(downloading.language_folder(['fr; Français', 'English']), 'English + fr; Français')
         self.assertEqual(downloading.slug('CON'), 'lang-con')
-        self.assertNotIn('..', downloading.language_folder(['../../français']))
+        self.assertEqual(downloading.language_folder(['CON']), '_CON')
+        self.assertNotIn('/', downloading.language_folder(['../../français']))
 
     def test_sqlite_dedup_retry_restart_and_deleted_file(self):
         dbpath = Path(self.tmp.name) / 'data.db'

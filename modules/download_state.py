@@ -6,8 +6,10 @@ from modules import downloading
 
 
 class DownloadState:
-    def __init__(self, db, root):
+    def __init__(self, db, root, languages=None):
         self.db, self.root = db, Path(root).resolve()
+        # None = toutes les langues ; [''] = uniquement les non-libellés.
+        self.languages = None if languages is None else list(dict.fromkeys(v.strip() for v in languages))
         db.cur.execute('''CREATE TABLE IF NOT EXISTS downloads
                           (
                               output_root  TEXT    NOT NULL,
@@ -23,9 +25,20 @@ class DownloadState:
                           )''')
         db.commit()
 
+    def _language_filter(self, url_column):
+        if self.languages is None:
+            return '', ()
+        placeholders = ','.join('?' for _ in self.languages)
+        return (f' AND EXISTS (SELECT 1 FROM audios AS language_source '
+                f'WHERE language_source.audio_url={url_column} '
+                f"AND TRIM(COALESCE(language_source.lang, '')) IN ({placeholders}))",
+                tuple(self.languages))
+
     def jobs(self):
         grouped = {}
-        for url, page, title, lang in self.db.cur.execute('SELECT audio_url,url,title,lang FROM audios ORDER BY id'):
+        clause, params = self._language_filter('audios.audio_url')
+        for url, page, title, lang in self.db.cur.execute(
+                'SELECT audio_url,url,title,lang FROM audios WHERE 1=1' + clause + ' ORDER BY id', params):
             if not url or not url.strip():
                 continue
             job = grouped.setdefault(url, dict(audio_url=url, title=title or 'audio', pages=[], languages=[]))
@@ -99,24 +112,28 @@ class DownloadState:
         return status
 
     def next_retry(self):
-        value = self.db.cur.execute("SELECT MIN(next_attempt) FROM downloads WHERE output_root=? AND status='retry'",
-                                    (str(self.root),)).fetchone()[0]
+        clause, params = self._language_filter('downloads.audio_url')
+        value = \
+        self.db.cur.execute("SELECT MIN(next_attempt) FROM downloads WHERE output_root=? AND status='retry'" + clause,
+                            (str(self.root), *params)).fetchone()[0]
         return max(value, self.db.pause_until()) if value is not None else None
 
     def reset_failed(self):
+        clause, params = self._language_filter('downloads.audio_url')
         self.db.cur.execute("""UPDATE downloads
                                SET status='pending',
                                    attempts=0,
                                    next_attempt=NULL
-                               WHERE output_root = ?
-                                 AND status IN ('retry', 'suspended', 'invalid')""", (str(self.root),))
+        WHERE output_root = ?
+          AND status IN ('retry', 'suspended', 'invalid')""" + clause, (str(self.root), *params))
         self.db.commit()
 
     def report(self):
+        clause, params = self._language_filter('downloads.audio_url')
         rows = self.db.cur.execute('''SELECT status, COUNT(*), COALESCE(SUM(size_bytes), 0)
                                       FROM downloads
                                       WHERE output_root = ?
-                                      GROUP BY status''', (str(self.root),)).fetchall()
+                                      ''' + clause + ' GROUP BY status', (str(self.root), *params)).fetchall()
         counts = {status: count for status, count, _ in rows}
         size = sum(size for status, _, size in rows if status == 'done')
         print(f'Téléchargements : {counts} ; volume enregistré : {size / 1e9:.3f} Go')
