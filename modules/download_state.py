@@ -1,4 +1,6 @@
 """État des téléchargements ; toutes les méthodes sont appelées par le coordinateur."""
+import csv
+import os
 import time
 from pathlib import Path
 
@@ -97,8 +99,9 @@ class DownloadState:
 
     def next_retry(self):
         clause, params = self._language_filter('downloads.audio_url')
-        value = self.db.cur.execute("SELECT MIN(next_attempt) FROM downloads WHERE output_root=? AND status='retry'" + clause,
-                                    (str(self.root), *params)).fetchone()[0]
+        value = \
+        self.db.cur.execute("SELECT MIN(next_attempt) FROM downloads WHERE output_root=? AND status='retry'" + clause,
+                            (str(self.root), *params)).fetchone()[0]
         return max(value, self.db.pause_until()) if value is not None else None
 
     def reset_failed(self):
@@ -107,8 +110,8 @@ class DownloadState:
                                SET status='pending',
                                    attempts=0,
                                    next_attempt=NULL
-                               WHERE output_root = ?
-                                 AND status IN ('retry', 'suspended', 'invalid')""" + clause, (str(self.root), *params))
+        WHERE output_root = ?
+          AND status IN ('retry', 'suspended', 'invalid')""" + clause, (str(self.root), *params))
         self.db.commit()
 
     def report(self):
@@ -121,3 +124,20 @@ class DownloadState:
         size = sum(size for status, _, size in rows if status == 'done')
         print(f'Téléchargements : {counts} ; volume enregistré : {size / 1e9:.3f} Go')
         return counts
+
+    def export_errors(self, path):
+        """Rapport remplaçable : aucune modification des URL ni suppression d'audio."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        clause, params = self._language_filter('downloads.audio_url')
+        rows = self.db.cur.execute('''SELECT audio_url, status, attempts, next_attempt, detail,
+                                      (SELECT GROUP_CONCAT(DISTINCT url) FROM audios
+                                       WHERE audios.audio_url=downloads.audio_url)
+                                      FROM downloads WHERE output_root=? AND status!='done'
+                                      ''' + clause + ' ORDER BY status, audio_url', (str(self.root), *params))
+        temp = path.with_suffix(path.suffix + '.tmp')
+        with temp.open('w', newline='', encoding='utf-8-sig') as stream:
+            writer = csv.writer(stream)
+            writer.writerow(['audio_url', 'status', 'attempts', 'next_attempt_unix', 'detail', 'pages'])
+            writer.writerows(rows)
+        os.replace(temp, path)

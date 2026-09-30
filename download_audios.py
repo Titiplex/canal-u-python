@@ -19,9 +19,11 @@ PROJECT = Path(__file__).resolve().parent
 
 
 def run(db_path=None, output=None, workers=4, interval=2.0, watch=False, limit=None, retry_failed=False,
-        languages=None):
+        languages=None, read_timeout=120):
     if workers < 1 or not 0 <= interval < float('inf') or (limit is not None and limit < 1):
         raise ValueError('Workers et limite >= 1 ; intervalle fini >= 0')
+    if not 0 < read_timeout < float('inf'):
+        raise ValueError('Délai de lecture fini > 0 requis')
     path = Path(db_path).resolve() if db_path else PROJECT / '.cache/data.db'
     if not path.is_file():
         raise FileNotFoundError(f'Base du crawl introuvable : {path}')
@@ -56,12 +58,13 @@ def run(db_path=None, output=None, workers=4, interval=2.0, watch=False, limit=N
                         status = state.fail(url, error)
                         logging.error('%s : %s : %s', status, url, error)
 
-                    _stage(jobs, workers, lambda url: downloading.download(jobs[url], root),
+                    _stage(jobs, workers, lambda url: downloading.download(jobs[url], root, read_timeout),
                            save, defer, unit='fichier')
                     deadline = state.next_retry()
                     if crawling.stopped() and state.jobs():
                         deadline = max(db.pause_until(), deadline or 0)
                 state.report()
+                state.export_errors(root / '_state' / 'download_errors.csv')
                 if deadline is None or not watch:
                     if deadline is not None:
                         print('Prochaine reprise :', datetime.fromtimestamp(deadline))
@@ -81,6 +84,8 @@ def build_parser():
     parser.add_argument('--interval', type=float, default=2.0,
                         help='Intervalle global entre départs HTTP ; débit des transferts non limité')
     parser.add_argument('--watch', action='store_true', help='Attendre et exécuter les reprises temporaires')
+    parser.add_argument('--read-timeout', type=float, default=120,
+                        help='Délai sans données reçues, en secondes (défaut : 120)')
     parser.add_argument('--limit', type=int, default=None, help='Maximum de fichiers par passage')
     parser.add_argument('--retry-failed', action='store_true',
                         help='Réactiver erreurs suspendues/non audio (pas les 404/410)')
@@ -94,6 +99,6 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.ERROR)
     try:
         run(args.db, args.output, args.workers, args.interval, args.watch, args.limit, args.retry_failed,
-            languages=args.languages)
+            languages=args.languages, read_timeout=args.read_timeout)
     except KeyboardInterrupt:
         print('\nArrêt demandé ; téléchargements validés et fichiers partiels conservés.')

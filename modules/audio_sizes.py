@@ -7,7 +7,7 @@ import requests
 from modules import crawling
 
 
-def _request(method, url, extra_headers=None):
+def _request(method, url, extra_headers=None, timeout=(10, 30)):
     # Redirections manuelles : Requests peut consommer leur corps automatiquement.
     session = crawling.get_client().session
     headers = {'Accept-Encoding': 'identity', **(extra_headers or {})}
@@ -16,7 +16,7 @@ def _request(method, url, extra_headers=None):
             raise ValueError('Redirection hors HTTP(S)')
         crawling._gate.pace()
         response = session.request(method, url, headers=headers, stream=True,
-                                   allow_redirects=False, timeout=(10, 30))
+                                   allow_redirects=False, timeout=timeout)
         if response.status_code not in {301, 302, 303, 307, 308}:
             return response
         location = response.headers.get('Location')

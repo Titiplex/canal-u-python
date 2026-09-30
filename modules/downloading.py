@@ -67,9 +67,46 @@ def read_json(path):
         return {}
 
 
+def image_format(prefix):
+    for signature, name in ((b'\x89PNG\r\n\x1a\n', 'PNG'), (b'\xff\xd8\xff', 'JPEG'),
+                            (b'GIF87a', 'GIF'), (b'GIF89a', 'GIF'), (b'BM', 'BMP'),
+                            (b'II*\x00', 'TIFF'), (b'MM\x00*', 'TIFF')):
+        if prefix.startswith(signature):
+            return name
+    if prefix.startswith(b'RIFF') and prefix[8:12] == b'WEBP':
+        return 'WebP'
+    return None
+
+
+def _adts_header(prefix, offset=0):
+    header = prefix[offset:offset + 7]
+    if len(header) < 7 or header[0] != 255 or header[1] & 246 != 240:
+        return None
+    # Synchronisation 12 bits, layer=0, fréquence définie et taille de trame.
+    if (header[2] >> 2) & 15 > 12:
+        return None
+    size = ((header[3] & 3) << 11) | (header[4] << 3) | (header[5] >> 5)
+    return size if size >= (7 if header[1] & 1 else 9) else None
+
+
 def audio_extension(prefix):
+    if image_format(prefix):
+        return None  # Ne pas trouver une fausse trame MPEG dans une image.
     if prefix.startswith(b'ID3'):
+        if len(prefix) >= 10 and prefix[3] in {2, 3, 4} and all(b < 128 for b in prefix[6:10]):
+            size = 10 + sum(b << shift for b, shift in zip(prefix[6:10], (21, 14, 7, 0)))
+            if prefix[3] == 4 and prefix[5] & 16:
+                size += 10  # Footer ID3v2.4.
+            if size < len(prefix):
+                detected = audio_extension(prefix[size:])
+                if detected:
+                    return detected
         return '.mp3'
+    frame_size = _adts_header(prefix)
+    if frame_size is not None and (frame_size + 7 > len(prefix) or _adts_header(prefix, frame_size) is not None):
+        return '.aac'
+    if prefix.startswith(b'ADIF'):
+        return '.aac'
     if len(prefix) >= 4:
         # En-tête MPEG audio : synchronisation, version/layer et débits valides.
         for i in range(min(len(prefix) - 3, 4096)):
@@ -91,9 +128,9 @@ def retry(message, delay=60, blocked=False):
     return crawling.RetryLater(message, delay=delay, blocked=blocked)
 
 
-def open_audio(url, headers):
+def open_audio(url, headers, read_timeout=120):
     """Même session et même challenge image que le crawler, un seul rafraîchissement."""
-    response = _request('GET', url, headers)
+    response = _request('GET', url, headers, timeout=(10, read_timeout))
     for attempt in range(2):
         code = response.status_code
         delay = response.headers.get('Retry-After')
@@ -122,7 +159,8 @@ def open_audio(url, headers):
                 response.close()
             if attempt == 0 and 'bot_challenge.png?' in text:
                 replacement = crawling.get_client()._image_challenge(
-                    sample, refresh_request=lambda target: _request('GET', target, headers))
+                    sample, refresh_request=lambda target: _request('GET', target, headers,
+                                                                    timeout=(10, read_timeout)))
                 if replacement is not sample:
                     response = replacement
                     continue
@@ -130,7 +168,8 @@ def open_audio(url, headers):
                 raise retry('Accès refusé ou challenge persistant', 300, True)
             if code >= 500 or 'unexpected error' in text.lower() or 'try again later' in text.lower():
                 raise retry('Erreur serveur à la place de l’audio')
-            raise InvalidAudio('Réponse HTML à la place de l’audio ; à examiner')
+            raise InvalidAudio(f'Réponse HTML à la place de l’audio ; HTTP={code} ; '
+                               f'MIME={mime} ; URL finale={response.url}')
         if code >= 500 or code in {408, 425}:
             response.close()
             raise retry(f'HTTP {code} : erreur temporaire')
@@ -150,7 +189,11 @@ def existing(job, root):
     if data.get('audio_url') != job['audio_url'] or not data.get('complete'):
         return None
     path = (root / data.get('file', '')).resolve()
-    if not path.is_relative_to(root.resolve()) or not path.is_file():
+    try:
+        path.relative_to(root.resolve())
+    except ValueError:
+        return None
+    if not path.is_file():
         return None
     if path.stat().st_size != data.get('size_bytes'):
         return None
@@ -160,7 +203,7 @@ def existing(job, root):
     return data
 
 
-def download(job, root):
+def download(job, root, read_timeout=120):
     root = Path(root).resolve()
     cached = existing(job, root)
     if cached:
@@ -179,7 +222,7 @@ def download(job, root):
     headers = {'Referer': job['pages'][0]} if job['pages'] else {}
     if offset:
         headers.update(Range=f'bytes={offset}-', **{'If-Range': etag})
-    response = open_audio(job['audio_url'], headers)
+    response = open_audio(job['audio_url'], headers, read_timeout)
     # 416 ou identité de représentation modifiée : repartir proprement une seule fois.
     if offset and (response.status_code == 416 or
                    (response.status_code == 206 and
@@ -188,7 +231,7 @@ def download(job, root):
         offset = 0
         headers.pop('Range', None);
         headers.pop('If-Range', None)
-        response = open_audio(job['audio_url'], headers)
+        response = open_audio(job['audio_url'], headers, read_timeout)
     with response:
         if response.status_code not in {200, 206}:
             raise InvalidAudio(f'HTTP {response.status_code} non exploitable')
@@ -212,18 +255,24 @@ def download(job, root):
             if len(prefix) >= 4096:
                 break
         first = bytes(prefix)
+        diagnostic = (f'HTTP={response.status_code} ; '
+                      f'MIME={response.headers.get("Content-Type", "inconnu")} ; '
+                      f'URL finale={response.url} ; début(hex)={first[:32].hex()}')
+        picture = image_format(first)
+        if picture:
+            raise InvalidAudio(f'Image {picture} à la place de l’audio ; {diagnostic}')
         stripped = first[:4096].lstrip().lower()
         if stripped.startswith((b'<', b'the website encountered')):
             if b'unexpected error' in stripped or b'try again later' in stripped:
                 raise retry('Erreur serveur renvoyée avec un type audio')
-            raise InvalidAudio('Texte/HTML renvoyé avec un type audio')
+            raise InvalidAudio(f'Texte/HTML renvoyé avec un type audio ; {diagnostic}')
         if offset:
             with part.open('rb') as stream:
                 extension = audio_extension(stream.read(4096))
         else:
             extension = audio_extension(first[:4096])
         if extension is None:
-            raise InvalidAudio('Signature audio non reconnue ; à examiner')
+            raise InvalidAudio(f'Signature audio non reconnue ; à examiner ; {diagnostic}')
         atomic_json(checkpoint, dict(audio_url=job['audio_url'], etag=response.headers.get('ETag', ''),
                                      final_url=response.url, total=total))
         with part.open('ab' if offset else 'wb') as stream:

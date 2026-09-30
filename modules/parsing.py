@@ -57,7 +57,7 @@ def _infos(root, url):
         if _dans_carte(source):
             continue
         type_audio = source["type"].split(";", 1)[0].strip().lower()
-        if type_audio in {"audio/mp3", "audio/mpeg"}:
+        if type_audio.startswith('audio/'):
             if not source["src"].strip():
                 continue
             lien = urljoin(url, source["src"])
